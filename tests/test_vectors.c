@@ -8,6 +8,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include "winpr_transcript.h"
 
 static int pass, failed;
 
@@ -28,7 +29,7 @@ static size_t unhex(const char *s, uint8_t *out)
 
 static void check_bytes(const char *what, const uint8_t *got, size_t len, const char *hex)
 {
-	uint8_t want[1024];
+	uint8_t want[2048];
 	size_t wl = unhex(hex, want), i;
 	if (wl == len && !memcmp(got, want, len)) { pass++; printf("ok   %s\n", what); return; }
 	failed++;
@@ -453,6 +454,64 @@ static void test_api(void)
 	GN_NTLMFree(n);
 }
 
+/* A WinPR server's accepted exchange (tests/winpr_transcript.h), replayed
+ * with its random values fixed: the NEGOTIATE, the AUTHENTICATE (MIC
+ * included) and the whole TSRequest with pubKeyAuth must come out byte for
+ * byte. A wrong password must change the MIC (what WinPR reports as "MIC
+ * verification failed"), and the empty domain must stay empty. */
+static void test_winpr_transcript(void)
+{
+	static uint8_t pub[270];
+	uint8_t chal[512], b[1024], a[2048], t8[8];
+	size_t cl, bl, al;
+	struct gn_cssp c;
+	struct gn_tsrequest q;
+	int e;
+	memset(pub, 0, sizeof pub);
+	memcpy(pub, "\x30\x82\x01\x0a\x02\x82\x01\x01\x00\xc3", 10);
+	cl = unhex(wp_chal_hex, chal);
+	e = gn_cssp_init(&c, "da1ek", "", "test123", "AMIGA", "daletop", pub, sizeof pub, 6);
+	check("WinPR transcript: CredSSP init (no domain)", e == 0 && c.domain16_len == 0 && c.ntlm.domain_len == 0);
+	c.ntlm.test = GN_NTLM_T_FIXED;
+	unhex(wp_time_hex, t8);
+	c.ntlm.t_time = (uint64_t)gn_get32(t8) | ((uint64_t)gn_get32(t8 + 4) << 32);
+	unhex(wp_cc_hex, c.ntlm.t_client_challenge);
+	unhex(wp_exported_hex, c.ntlm.t_session_key);
+	c.test = GN_CSSP_T_FIXED_NONCE;
+	unhex(wp_nonce_hex, c.nonce);
+	e = gn_cssp_step(&c, NULL, 0, a, sizeof a, &al);
+	if (e == GN_CONTINUE && gn_tsrequest_decode(a, al, &q) == 0 && q.nego_token)
+		check_bytes("WinPR transcript: NEGOTIATE", q.nego_token, q.nego_token_len, wp_neg_hex);
+	else check("WinPR transcript: NEGOTIATE", 0);
+	memset(&q, 0, sizeof q);
+	q.version = 6; q.nego_token = chal; q.nego_token_len = cl;
+	bl = gn_tsrequest_encode(&q, b, sizeof b);
+	e = gn_cssp_step(&c, b, bl, a, sizeof a, &al);
+	if (e == GN_CONTINUE && gn_tsrequest_decode(a, al, &q) == 0 && q.nego_token) {
+		check_bytes("WinPR transcript: AUTHENTICATE with the MIC", q.nego_token, q.nego_token_len, wp_auth_hex);
+		check("WinPR transcript: AUTHENTICATE DomainName empty", gn_get16(q.nego_token + 28) == 0);
+		check_bytes("WinPR transcript: TSRequest with pubKeyAuth and clientNonce (v6)", a, al, wp_pkauth_hex);
+	} else check("WinPR transcript: AUTHENTICATE", 0);
+	gn_cssp_clear(&c);
+	/* the same exchange with another password: the MIC differs */
+	{
+		struct gn_ntlm n;
+		uint8_t neg[64], auth[1024], want[1024];
+		size_t nl, aul;
+		gn_ntlm_init(&n, "da1ek", "", "test124", "AMIGA", "TERMSRV/daletop");
+		n.test = GN_NTLM_T_FIXED;
+		n.t_time = (uint64_t)gn_get32(t8) | ((uint64_t)gn_get32(t8 + 4) << 32);
+		unhex(wp_cc_hex, n.t_client_challenge);
+		unhex(wp_exported_hex, n.t_session_key);
+		gn_ntlm_negotiate(&n, neg, sizeof neg, &nl);
+		e = gn_ntlm_authenticate(&n, chal, cl, auth, sizeof auth, &aul);
+		unhex(wp_auth_hex, want);
+		check("WinPR transcript: another password changes the MIC",
+		      e == 0 && aul > 88 && memcmp(auth + 72, want + 72, 16) != 0);
+		gn_ntlm_clear(&n);
+	}
+}
+
 int main(void)
 {
 	test_md4();
@@ -461,6 +520,7 @@ int main(void)
 	test_rc4();
 	test_sha256();
 	test_nlmp();
+	test_winpr_transcript();
 	test_der();
 	test_api();
 	credssp_run(6, "Password", 0, GNERR_OK);
