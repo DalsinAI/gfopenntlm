@@ -236,7 +236,10 @@ LONG GN_CredSSPMessageLength(CONST_APTR data, ULONG length)
 {
 	long n;
 	if (!data) return GNERR_BADARGS;
+	/* length 0: do not touch data[0] (L1 over-read). Incomplete → 0. */
+	if (length == 0) return 0;
+	if (((const UBYTE *)data)[0] != 0x30) return GNERR_PROTOCOL;
 	n = gn_der_message_length(data, length);
-	if (n < 0 || ((const UBYTE *)data)[0] != 0x30) return GNERR_PROTOCOL;
+	if (n < 0) return GNERR_PROTOCOL;
 	return (LONG)n;
 }

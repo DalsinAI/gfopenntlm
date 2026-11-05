@@ -31,7 +31,7 @@ typedef void *APTR; typedef const void *CONST_APTR; typedef const char *CONST_ST
 
 /* GN_Version(): (library version << 16) | revision */
 #define GN_LIB_VERSION  1
-#define GN_LIB_REVISION 1
+#define GN_LIB_REVISION 2
 
 /* Results. GNERR_CONTINUE: send the output and call again with the reply. */
 #define GNERR_OK            0

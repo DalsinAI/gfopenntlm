@@ -133,7 +133,13 @@ int gn_ntlm_negotiate(struct gn_ntlm *n, uint8_t *out, size_t size, size_t *outl
 
 static int get_field(const uint8_t *msg, size_t len, size_t at, const uint8_t **p, size_t *flen)
 {
-	uint32_t l = gn_get16(msg + at), off = gn_get32(msg + at + 4);
+	uint32_t l, maxl, off;
+	if (at + 8 > len) return -1;
+	l = gn_get16(msg + at);
+	maxl = gn_get16(msg + at + 2);
+	off = gn_get32(msg + at + 4);
+	/* MaxLen must be >= Len ([MS-NLMP] 2.2.2.5); reject nonsense (L3). */
+	if (l > maxl) return -1;
 	if (l == 0) { *p = msg; *flen = 0; return 0; }
 	if (off > len || l > len - off) return -1;
 	*p = msg + off;

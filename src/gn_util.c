@@ -7,7 +7,7 @@ void gn_put32(uint8_t *p, uint32_t v)
 {
 	p[0] = (uint8_t)v; p[1] = (uint8_t)(v >> 8); p[2] = (uint8_t)(v >> 16); p[3] = (uint8_t)(v >> 24);
 }
-uint16_t gn_get16(const uint8_t *p) { return (uint16_t)(p[0] | (p[1] << 8)); }
+uint16_t gn_get16(const uint8_t *p) { return (uint16_t)((uint32_t)p[0] | ((uint32_t)p[1] << 8)); }
 uint32_t gn_get32(const uint8_t *p)
 {
 	return (uint32_t)p[0] | ((uint32_t)p[1] << 8) | ((uint32_t)p[2] << 16) | ((uint32_t)p[3] << 24);
@@ -98,16 +98,28 @@ uint8_t *gn_utf16(const char *s, int up, size_t *outlen)
 	while (*p) {
 		uint32_t c = *p++;
 		int extra = 0;
-		if (c >= 0xf0 && c < 0xf8) { c &= 7; extra = 3; }
-		else if (c >= 0xe0) { c &= 15; extra = 2; }
-		else if (c >= 0xc0) { c &= 31; extra = 1; }
-		else if (c >= 0x80) c = 0xfffd;
-		while (extra--) {
+		uint32_t min_c = 0;
+		/* Reject overlong encodings and bare continuation / invalid leads (L2). */
+		if (c < 0x80) { /* ASCII */ }
+		else if (c >= 0xc2 && c <= 0xdf) { c &= 0x1f; extra = 1; min_c = 0x80; }
+		else if (c >= 0xe0 && c <= 0xef) { c &= 0x0f; extra = 2; min_c = 0x800; }
+		else if (c >= 0xf0 && c <= 0xf4) { c &= 0x07; extra = 3; min_c = 0x10000; }
+		else { c = 0xfffd; } /* C0/C1 overlong lead, F5-FF, or continuation */
+		while (extra > 0) {
 			if ((*p & 0xc0) != 0x80) { c = 0xfffd; break; }
-			c = (c << 6) | (*p++ & 63);
+			c = (c << 6) | (*p++ & 0x3f);
+			extra--;
 		}
+		if (extra != 0)
+			c = 0xfffd;
+		else if (c != 0xfffd && c < min_c)
+			c = 0xfffd; /* overlong */
+		else if (c >= 0xd800 && c <= 0xdfff)
+			c = 0xfffd; /* UTF-16 surrogate */
+		else if (c > 0x10ffff)
+			c = 0xfffd;
 		if (up) c = gn_upper(c);
-		if (c >= 0x10000 && c < 0x110000) {
+		if (c >= 0x10000 && c <= 0x10ffff) {
 			c -= 0x10000;
 			gn_put16(out + n, (uint16_t)(0xd800 | (c >> 10)));
 			gn_put16(out + n + 2, (uint16_t)(0xdc00 | (c & 0x3ff)));

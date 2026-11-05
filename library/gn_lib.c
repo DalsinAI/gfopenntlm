@@ -1,4 +1,4 @@
-/* gfopenntlm.library 1.1: NTLMv2 ([MS-NLMP]) and CredSSP ([MS-CSSP]) for
+/* gfopenntlm.library 1.1.1: NTLMv2 ([MS-NLMP]) and CredSSP ([MS-CSSP]) for
  * AmigaOS 3.x. docs/gfopenntlm.doc is the contract; the calls are the C
  * functions of src/gn_api.c behind the entry points of gn_entries.h.
  * MIT licensed. Copyright (c) 2026 AmiCradle Team. */
@@ -27,9 +27,9 @@ int start(void) { return -1; }
 
 static const char lib_name[] = GFOPENNTLMLIB_NAME;
 static const char lib_id[] =
-	"gfopenntlm.library 1.1 (05.11.2026) NTLMv2 and CredSSP, AmiCradle Team\r\n";
+	"gfopenntlm.library 1.1.1 (05.11.2026) NTLMv2 and CredSSP, AmiCradle Team\r\n";
 static const char lib_ver[] __attribute__((used)) =
-	"$VER: gfopenntlm.library 1.1 (05.11.2026) NTLMv2 and CredSSP, AmiCradle Team";
+	"$VER: gfopenntlm.library 1.1.1 (05.11.2026) NTLMv2 and CredSSP, AmiCradle Team";
 
 static struct Library *lib_init(REG(d0, struct GNLibBase *base), REG(a0, BPTR seglist),
                                 REG(a6, struct ExecBase *sys));

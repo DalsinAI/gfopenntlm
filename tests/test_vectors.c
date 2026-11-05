@@ -544,7 +544,7 @@ static void test_api(void)
 	struct GNNTLM *n;
 	LONG e;
 	ULONG l;
-	check("GN_Version 1.1", GN_Version() == 0x10001);
+	check("GN_Version 1.1.1", GN_Version() == 0x10002);
 	check("GN_Digest MD4", GN_Digest(GNALG_MD4, "abc", 3, d) == 0 && !memcmp(d, "\xa4\x48\x01\x7a", 4));
 	check("GN_HMAC MD5", GN_HMAC(GNALG_MD5, "Jefe", 4, "what do ya want for nothing?", 28, d) == 0 &&
 	      !memcmp(d, "\x75\x0c\x78\x3e", 4));

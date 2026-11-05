@@ -300,6 +300,14 @@ int gn_cssp_step(struct gn_cssp *c, const uint8_t *in, size_t inlen,
 		                        c->pass16, c->pass16_len, cred, credlen);
 		e = gn_ntlm_wrap(&c->ntlm, cred, credlen, tok, toklen, &n);
 		gn_free(cred, credlen);
+		/* Wipe password material as soon as authInfo is sealed. */
+		if (c->pass16) {
+			gn_free(c->pass16, c->pass16_len + 2);
+			c->pass16 = NULL;
+			c->pass16_len = 0;
+		}
+		gn_wipe(c->ntlm.nt_hash, sizeof c->ntlm.nt_hash);
+		gn_wipe(c->ntlm.response_key, sizeof c->ntlm.response_key);
 		if (e) goto out;
 		q.auth_info = tok; q.auth_info_len = n;
 		n = gn_tsrequest_encode(&q, out, size);
