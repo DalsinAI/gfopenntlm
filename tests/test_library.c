@@ -51,6 +51,13 @@ int main(void)
 	check("GN_NTLMNew", n != NULL && e == GNERR_OK);
 	check("GN_NTLMNegotiate", n && GN_NTLMNegotiate(n, d, sizeof d, &l) == 0 && l == 40 && !memcmp(d, "NTLMSSP", 8));
 	GN_NTLMFree(n);
+	{
+		static const UBYTE h[32] = { 1, 2, 3 };
+		nc.Flags = GNF_CB_TLS_SERVER_END_POINT; nc.ChannelBindings = h; nc.ChannelBindingsLength = 32;
+		n = GN_NTLMNew(&nc, &e);
+		check("GN_NTLMNew with channel bindings (1.1)", n && GN_NTLMGetAttr(n, GNA_CHANNELBINDINGS) == 1);
+		GN_NTLMFree(n);
+	}
 	check("GN_ErrorText", !strcmp((const char *)GN_ErrorText(GNERR_SERVER), "the server reported an error"));
 	printf("%d passed, %d failed\n", pass, fail);
 #ifndef GFOPENNTLM_STATIC

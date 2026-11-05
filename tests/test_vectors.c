@@ -6,6 +6,7 @@
 #include "../src/gn_internal.h"
 #include <clib/gfopenntlm_protos.h>
 #include <stdio.h>
+#include <stddef.h>
 #include <stdlib.h>
 #include <string.h>
 #include "winpr_transcript.h"
@@ -229,7 +230,24 @@ struct srv {
 	uint8_t nonce[32];
 	char got_user[64], got_pass[64];
 	int verified_mic;
+	const char *user_upper;  /* the UTF-8 Uppercase(User), if not ASCII */
+	uint8_t want_cb[16];     /* the MsvChannelBindings the server expects */
+	int got_cb_ok;           /* the AUTHENTICATE carried want_cb */
 };
+
+/* the value of AV pair id in an NTLMv2 response's temp, or NULL */
+static const uint8_t *find_av(const uint8_t *nt, size_t ntl, uint16_t id, size_t *len)
+{
+	size_t i = 16 + 28;   /* NTProofStr, then temp's fixed part */
+	while (i + 4 <= ntl) {
+		uint16_t t = gn_get16(nt + i), l = gn_get16(nt + i + 2);
+		if (i + 4 + l > ntl) return NULL;
+		if (t == id) { *len = l; return nt + i + 4; }
+		if (t == MsvAvEOL) return NULL;
+		i += 4u + l;
+	}
+	return NULL;
+}
 
 static void ascii16(const uint8_t *p, size_t len, char *out, size_t size)
 {
@@ -286,11 +304,29 @@ static size_t srv_authenticate(struct srv *s, const uint8_t *in, size_t len, uin
 	dom = m + gn_get32(m + 32); dl = gn_get16(m + 28);
 	user = m + gn_get32(m + 40); ul = gn_get16(m + 36);
 	ascii16(user, ul, s->got_user, sizeof s->got_user);
-	for (i = 0; i < ul && i < sizeof uu; i += 2) {
-		uu[i] = (user[i] >= 'a' && user[i] <= 'z') ? (uint8_t)(user[i] - 32) : user[i];
-		uu[i + 1] = user[i + 1];
+	if (s->user_upper) {
+		uint8_t *u16 = gn_utf16(s->user_upper, 0, &uul);
+		if (uul > sizeof uu) uul = sizeof uu;
+		memcpy(uu, u16, uul);
+		gn_free(u16, uul + 2);
+	} else {
+		for (i = 0; i < ul && i < sizeof uu; i += 2) {
+			uu[i] = (user[i] >= 'a' && user[i] <= 'z') ? (uint8_t)(user[i] - 32) : user[i];
+			uu[i + 1] = user[i + 1];
+		}
+		uul = ul;
 	}
-	uul = ul;
+	{
+		const uint8_t *cb;
+		size_t cbl;
+		cb = find_av(nt, ntl, MsvChannelBindings, &cbl);
+		s->got_cb_ok = cb && cbl == 16 && !memcmp(cb, s->want_cb, 16);
+		/* a server with channel bindings refuses others ([MS-NLMP] 3.2.5.1.2) */
+		if (!s->got_cb_ok) {
+			a.has_error = 1; a.error_code = 0xc000006du;
+			return gn_tsrequest_encode(&a, out, size);
+		}
+	}
 	pw16 = gn_utf16(s->password, 0, &pwl);
 	gn_md4(pw16, pwl, nth);
 	gn_free(pw16, pwl + 2);
@@ -357,7 +393,19 @@ static int srv_credentials(struct srv *s, const uint8_t *in, size_t len)
 	return 1;
 }
 
-static void credssp_run(uint32_t version, const char *client_pw, int bad_pubkey, int want)
+struct run {
+	uint32_t version;
+	const char *client_pw;
+	int bad_pubkey;
+	int want;
+	const char *user, *user_upper, *domain;  /* default "User", "FAKE" */
+	const uint8_t *cb; ULONG cbl; ULONG flags; /* the client's channel bindings */
+	int server_cb;           /* 1: the server expects cb; 0: Z(16) */
+	int client_unbound;      /* the client is not given cb */
+	const char *label;
+};
+
+static void credssp_run_ex(const struct run *o)
 {
 	struct GNCredSSPConfig cfg;
 	struct GNCredSSP *c;
@@ -366,20 +414,27 @@ static void credssp_run(uint32_t version, const char *client_pw, int bad_pubkey,
 	ULONG al;
 	size_t bl;
 	LONG e, r;
-	char name[128];
+	char name[160];
+	const char *user = o->user ? o->user : "User";
 	memset(&s, 0, sizeof s);
 	s.password = "Password";
-	s.version = version;
-	s.bad_pubkey = bad_pubkey;
+	s.version = o->version;
+	s.bad_pubkey = o->bad_pubkey;
+	s.user_upper = o->user_upper;
+	if (o->server_cb) gn_channel_bindings_hash(o->cb, o->cbl, (o->flags & GNF_CB_TLS_SERVER_END_POINT) != 0, s.want_cb);
 	s.pklen = unhex("3048024100c0ffee0102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f2021222324252627"
 	                "28292a2b2c2d2e2f303132333435363738393a3b3c3d3e0203010001", s.pubkey);
 	memset(&cfg, 0, sizeof cfg);
 	cfg.Size = sizeof cfg;
-	cfg.User = "User"; cfg.Domain = "FAKE"; cfg.Password = client_pw; cfg.Workstation = "AMIGA";
+	cfg.User = user; cfg.Domain = o->domain ? o->domain : "FAKE"; cfg.Password = o->client_pw; cfg.Workstation = "AMIGA";
 	cfg.ServerName = "srv.example"; cfg.PublicKey = s.pubkey; cfg.PublicKeyLength = (ULONG)s.pklen;
+	if (!o->client_unbound) {
+		cfg.Flags = o->flags; cfg.ChannelBindings = o->cb; cfg.ChannelBindingsLength = o->cbl;
+	}
 	c = GN_CredSSPNew(&cfg, &e);
-	snprintf(name, sizeof name, "CredSSP v%u%s%s", (unsigned)version,
-	         strcmp(client_pw, "Password") ? " wrong password" : "", bad_pubkey ? " bad server binding" : "");
+	snprintf(name, sizeof name, "CredSSP v%u%s%s%s", (unsigned)o->version,
+	         strcmp(o->client_pw, "Password") ? " wrong password" : "", o->bad_pubkey ? " bad server binding" : "",
+	         o->label ? o->label : "");
 	if (!c) { check(name, 0); return; }
 	r = GN_CredSSPStep(c, NULL, 0, a, sizeof a, &al);
 	{
@@ -393,20 +448,72 @@ static void credssp_run(uint32_t version, const char *client_pw, int bad_pubkey,
 	bl = srv_authenticate(&s, a, al, b, sizeof b);
 	if (!bl) { printf("  (the test server refused the AUTHENTICATE)\n"); check(name, 0); goto out; }
 	r = GN_CredSSPStep(c, b, (ULONG)bl, a, sizeof a, &al);
-	if (want == GNERR_SERVER) {
+	if (o->want == GNERR_SERVER) {
 		snprintf(name + strlen(name), sizeof name - strlen(name), ": errorCode 0x%08lx", (unsigned long)GN_CredSSPGetAttr(c, GNA_SERVERERROR));
 		check(name, r == GNERR_SERVER && GN_CredSSPGetAttr(c, GNA_SERVERERROR) == 0xc000006du);
-	} else if (want == GNERR_PUBKEY) {
+	} else if (o->want == GNERR_PUBKEY) {
 		check(name, r == GNERR_PUBKEY);
 	} else {
-		int ok = r == GNERR_OK && srv_credentials(&s, a, al) && s.verified_mic &&
-		         !strcmp(s.got_user, "User") && !strcmp(s.got_pass, "Password") &&
-		         GN_CredSSPGetAttr(c, GNA_VERSION) == version;
+		int ok = r == GNERR_OK && srv_credentials(&s, a, al) && s.verified_mic && s.got_cb_ok &&
+		         !strcmp(s.got_pass, "Password") && GN_CredSSPGetAttr(c, GNA_VERSION) == o->version &&
+		         GN_CredSSPGetAttr(c, GNA_CHANNELBINDINGS) == (o->cb ? 1u : 0u);
+		if (!o->user_upper) ok &= !strcmp(s.got_user, user);
 		check(name, ok);
+		if (!o->label && o->version == 6 && !o->bad_pubkey) {
+			/* the NTLM attributes, read through the CredSSP handle */
+			check("  GN_CredSSPGetAttr(GNA_NTLMFLAGS): the negotiated flags",
+			      GN_CredSSPGetAttr(c, GNA_NTLMFLAGS) == (0xe28a8235u & GN_NTLM_CLIENT_FLAGS));
+			check("  GN_CredSSPGetAttr(GNA_NTLMPEERVERSION): the CHALLENGE's Version",
+			      GN_CredSSPGetAttr(c, GNA_NTLMPEERVERSION) == 0x4a61000au);
+			check("  GN_CredSSPGetAttr(GNA_STATE) is CredSSP's (3)", GN_CredSSPGetAttr(c, GNA_STATE) == 3);
+			check("  GN_CredSSPGetAttr of an unknown attribute is 0", GN_CredSSPGetAttr(c, 999) == 0);
+		}
 	}
 out:
 	GN_CredSSPFree(c);
 	gn_ntlm_clear(&s.keys);
+}
+
+static void credssp_run(uint32_t version, const char *client_pw, int bad_pubkey, int want)
+{
+	struct run o;
+	memset(&o, 0, sizeof o);
+	o.version = version; o.client_pw = client_pw; o.bad_pubkey = bad_pubkey; o.want = want;
+	credssp_run_ex(&o);
+}
+
+/* a stand-in tls-server-end-point hash: SHA-256("gfopenntlm test certificate") */
+static const char cert_hash_hex[] = "8b8c6f1e7d7075840fe6b90d2742de3162bc60440424f9148f1c6f43a501bf7f";
+
+static void test_credssp_bindings(void)
+{
+	struct run o;
+	uint8_t h[32];
+	unhex(cert_hash_hex, h);
+	memset(&o, 0, sizeof o);
+	o.version = 6; o.client_pw = "Password"; o.want = GNERR_OK;
+	o.cb = h; o.cbl = 32; o.flags = GNF_CB_TLS_SERVER_END_POINT; o.server_cb = 1;
+	o.label = " with tls-server-end-point channel bindings";
+	credssp_run_ex(&o);
+	o.version = 3; o.label = " with tls-server-end-point channel bindings";
+	credssp_run_ex(&o);
+	/* a server that has bindings refuses an unbound client */
+	o.version = 6; o.client_unbound = 1; o.want = GNERR_SERVER;
+	o.label = " unbound client, server with bindings";
+	credssp_run_ex(&o);
+	/* and an unbound server refuses a bound client (it expects Z(16)) */
+	o.client_unbound = 0; o.server_cb = 0;
+	o.label = " bound client, unbound strict test server";
+	credssp_run_ex(&o);
+	/* non-ASCII user name: NTOWFv2's Uppercase(User) beyond Latin-1 */
+	memset(&o, 0, sizeof o);
+	o.version = 6; o.client_pw = "Password"; o.want = GNERR_OK;
+	o.user = "jörg.łukasz"; o.user_upper = "JÖRG.ŁUKASZ"; o.domain = "Müller-Straße";
+	o.label = " user jörg.łukasz (Latin Extended-A upper case)";
+	credssp_run_ex(&o);
+	o.user = "иван"; o.user_upper = "ИВАН"; o.domain = "Домен";
+	o.label = " user иван (Cyrillic upper case)";
+	credssp_run_ex(&o);
 }
 
 static void test_der(void)
@@ -437,7 +544,7 @@ static void test_api(void)
 	struct GNNTLM *n;
 	LONG e;
 	ULONG l;
-	check("GN_Version 1.0", GN_Version() == 0x10000);
+	check("GN_Version 1.1", GN_Version() == 0x10001);
 	check("GN_Digest MD4", GN_Digest(GNALG_MD4, "abc", 3, d) == 0 && !memcmp(d, "\xa4\x48\x01\x7a", 4));
 	check("GN_HMAC MD5", GN_HMAC(GNALG_MD5, "Jefe", 4, "what do ya want for nothing?", 28, d) == 0 &&
 	      !memcmp(d, "\x75\x0c\x78\x3e", 4));
@@ -512,6 +619,192 @@ static void test_winpr_transcript(void)
 	}
 }
 
+/* M8: Uppercase() past ASCII and Latin-1 (gn_util.c lists the subset) */
+static void test_upper(void)
+{
+	static const uint32_t v[][2] = {
+		{ 'a', 'A' }, { 'Z', 'Z' }, { '1', '1' }, { 0xe9, 0xc9 }, { 0xf7, 0xf7 }, { 0xff, 0x178 },
+		{ 0xdf, 0xdf },      /* sharp s: no 1:1 capital */
+		{ 0xb5, 0xb5 },      /* micro sign: left alone (documented) */
+		{ 0x101, 0x100 }, { 0x107, 0x106 }, { 0x10d, 0x10c }, { 0x111, 0x110 }, { 0x119, 0x118 },
+		{ 0x11f, 0x11e }, { 0x131, 0x131 }, { 0x130, 0x130 }, { 0x13e, 0x13d }, { 0x142, 0x141 },
+		{ 0x144, 0x143 }, { 0x148, 0x147 }, { 0x151, 0x150 }, { 0x153, 0x152 }, { 0x159, 0x158 },
+		{ 0x15b, 0x15a }, { 0x15f, 0x15e }, { 0x161, 0x160 }, { 0x165, 0x164 }, { 0x16f, 0x16e },
+		{ 0x171, 0x170 }, { 0x17a, 0x179 }, { 0x17c, 0x17b }, { 0x17e, 0x17d }, { 0x17f, 0x17f },
+		{ 0x1c6, 0x1c4 }, { 0x1c5, 0x1c4 }, { 0x1c4, 0x1c4 }, { 0x1ce, 0x1cd }, { 0x1dd, 0x18e },
+		{ 0x219, 0x218 }, { 0x21b, 0x21a }, { 0x259, 0x18f }, { 0x292, 0x1b7 },
+		{ 0x3ac, 0x386 }, { 0x3b1, 0x391 }, { 0x3c2, 0x3a3 }, { 0x3c3, 0x3a3 }, { 0x3c9, 0x3a9 },
+		{ 0x3ce, 0x38f }, { 0x390, 0x390 },
+		{ 0x430, 0x410 }, { 0x436, 0x416 }, { 0x44f, 0x42f }, { 0x451, 0x401 }, { 0x456, 0x406 },
+		{ 0x457, 0x407 }, { 0x45e, 0x40e }, { 0x491, 0x490 }, { 0x4d9, 0x4d8 }, { 0x4e9, 0x4e8 },
+		{ 0x4c2, 0x4c1 }, { 0x561, 0x531 }, { 0x586, 0x556 },
+		{ 0x1e03, 0x1e02 }, { 0x1ea1, 0x1ea0 }, { 0x1ef9, 0x1ef8 }, { 0xff41, 0xff21 }, { 0xff5a, 0xff3a },
+		{ 0x10428, 0x10428 }, /* outside the BMP: left alone */
+	};
+	size_t i, l;
+	int ok = 1;
+	uint8_t *u;
+	for (i = 0; i < sizeof v / sizeof v[0]; i++)
+		if (gn_upper(v[i][0]) != v[i][1]) {
+			printf("  U+%04X -> U+%04X, want U+%04X\n", (unsigned)v[i][0], (unsigned)gn_upper(v[i][0]), (unsigned)v[i][1]);
+			ok = 0;
+		}
+	check("Uppercase: Latin-1, Latin Extended-A/B, IPA, Greek, Cyrillic, Armenian, fullwidth", ok);
+	/* through gn_utf16: UTF-8 in, upper-case UTF-16LE out, surrogates kept */
+	u = gn_utf16("żółć Ελλάς ёж \xf0\x9f\x98\x80", 1, &l);
+	{
+		uint8_t *w = gn_utf16("ŻÓŁĆ ΕΛΛΆΣ ЁЖ \xf0\x9f\x98\x80", 0, &l);
+		size_t l2;
+		uint8_t *u2 = gn_utf16("żółć Ελλάς ёж \xf0\x9f\x98\x80", 1, &l2);
+		check("gn_utf16 upper: Polish, Greek, Cyrillic and an emoji", l == l2 && !memcmp(u2, w, l));
+		gn_free(w, l + 2);
+		gn_free(u2, l2 + 2);
+	}
+	gn_free(u, l + 2);
+}
+
+/* NTOWFv2 with non-ASCII names; the answers are HMAC_MD5(NTOWFv1("Password")
+ * of [MS-NLMP] 4.2.2.1.2, UTF-16LE(Uppercase(User) + UserDom)) worked out
+ * independently. Only User is upper-cased (3.3.2). */
+static void test_ntowfv2_unicode(void)
+{
+	static const char *const v[][3] = {
+		{ "jörg.łukasz", "Müller-Straße", "6cd9c1f50a99f331126ba7027315b2e4" },
+		{ "иван", "Домен", "009a3f664e2c6b689c58b1374bf34f67" },
+		{ "ǆemal ÿves", "", "3b4409098195977934fdf217ad05c7d4" },
+	};
+	size_t i;
+	for (i = 0; i < sizeof v / sizeof v[0]; i++) {
+		struct gn_ntlm n;
+		char name[96];
+		snprintf(name, sizeof name, "NTOWFv2 user \"%s\" domain \"%s\"", v[i][0], v[i][1]);
+		if (gn_ntlm_init(&n, v[i][0], v[i][1], "Password", "WS", NULL)) { check(name, 0); continue; }
+		check_bytes(name, n.response_key, 16, v[i][2]);
+		gn_ntlm_clear(&n);
+	}
+}
+
+/* M2: MsvChannelBindings. The hash is MD5(Z(16) + LE32(length) +
+ * application_data) (RFC 2744 3.11, [MS-NLMP] 2.2.2.1), worked out
+ * independently for the stand-in certificate hash. With bindings the
+ * AUTHENTICATE of the WinPR transcript must differ only where it should
+ * (MsvChannelBindings, NTProofStr, the encrypted session key and the MIC);
+ * unbound, it stays byte for byte the transcript. */
+static void test_bindings(void)
+{
+	uint8_t h[32], cb[16], app[64], chal[512], neg[64], auth[1024], want[1024], t8[8];
+	size_t cl, nl, aul, wl, cbl, i;
+	const uint8_t *p, *wnt, *gnt;
+	struct gn_ntlm n;
+	int e, ok;
+	unhex(cert_hash_hex, h);
+	gn_channel_bindings_hash(h, 32, 1, cb);
+	check_bytes("channel bindings: MD5 of gss_channel_bindings_struct (tls-server-end-point)", cb, 16,
+	            "7f0263277b94709b632f68bb3db2a381");
+	memcpy(app, "tls-server-end-point:", 21); memcpy(app + 21, h, 32);
+	gn_channel_bindings_hash(app, 53, 0, cb + 0);
+	check_bytes("channel bindings: the same as raw application_data", cb, 16, "7f0263277b94709b632f68bb3db2a381");
+
+	cl = unhex(wp_chal_hex, chal);
+	wl = unhex(wp_auth_hex, want);
+	unhex(wp_time_hex, t8);
+	for (i = 0; i < 2; i++) {
+		gn_ntlm_init(&n, "da1ek", "", "test123", "AMIGA", "TERMSRV/daletop");
+		n.test = GN_NTLM_T_FIXED;
+		n.t_time = (uint64_t)gn_get32(t8) | ((uint64_t)gn_get32(t8 + 4) << 32);
+		unhex(wp_cc_hex, n.t_client_challenge);
+		unhex(wp_exported_hex, n.t_session_key);
+		e = i ? gn_ntlm_set_bindings(&n, h, 32, 1) : gn_ntlm_set_bindings(&n, NULL, 0, 0);
+		gn_ntlm_negotiate(&n, neg, sizeof neg, &nl);
+		e |= gn_ntlm_authenticate(&n, chal, cl, auth, sizeof auth, &aul);
+		if (!i) {
+			check_bytes("channel bindings: unbound (NULL) still gives the WinPR AUTHENTICATE", auth, aul, wp_auth_hex);
+			gn_ntlm_clear(&n);
+			continue;
+		}
+		check("channel bindings: bound AUTHENTICATE, same length", e == 0 && aul == wl);
+		gnt = auth + gn_get32(auth + 24); wnt = want + gn_get32(want + 24);
+		p = find_av(gnt, gn_get16(auth + 20), MsvChannelBindings, &cbl);
+		gn_channel_bindings_hash(h, 32, 1, cb);
+		check("channel bindings: MsvChannelBindings carries the hash", p && cbl == 16 && !memcmp(p, cb, 16));
+		p = find_av(wnt, gn_get16(want + 20), MsvChannelBindings, &cbl);
+		check("channel bindings: the unbound transcript has Z(16)", p && cbl == 16 && !memcmp(p, "\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0", 16));
+		/* everything but NTProofStr, MsvChannelBindings, the encrypted key and the MIC is the same */
+		ok = !memcmp(auth, want, 72) && memcmp(auth + 72, want + 72, 16) != 0;
+		ok &= memcmp(gnt, wnt, 16) != 0;
+		{
+			size_t off = (size_t)(gnt - auth), cbo = (size_t)(p - wnt) + off;
+			size_t ntl = gn_get16(auth + 20), ko = gn_get32(auth + 56);
+			ok &= !memcmp(auth + 88, want + 88, off - 88);                   /* names, LM */
+			ok &= !memcmp(auth + off + 16, want + off + 16, cbo - off - 16); /* temp up to the bindings */
+			ok &= !memcmp(auth + cbo + 16, want + cbo + 16, off + ntl - cbo - 16);
+			ok &= memcmp(auth + ko, want + ko, 16) != 0;                     /* KXKEY differs */
+		}
+		check("channel bindings: only NTProofStr, MsvChannelBindings, the session key and the MIC change", ok);
+		/* NTProofStr recomputed from the message: the bindings are inside it */
+		{
+			uint8_t proof[16];
+			struct gn_hmac_md5 hm;
+			gn_hmac_md5_init(&hm, n.response_key, 16);
+			gn_hmac_md5_update(&hm, chal + 24, 8);
+			gn_hmac_md5_update(&hm, gnt + 16, gn_get16(auth + 20) - 16);
+			gn_hmac_md5_final(&hm, proof);
+			check("channel bindings: NTProofStr covers MsvChannelBindings", !memcmp(proof, gnt, 16));
+		}
+		check("channel bindings: GN_ntlm_set_bindings after AUTHENTICATE is out of order",
+		      gn_ntlm_set_bindings(&n, h, 32, 1) == GN_ESTATE);
+		gn_ntlm_clear(&n);
+	}
+	(void)wl;
+}
+
+/* the 1.1 config fields through the API, and L5's honest GetAttr */
+static void test_api_bindings(void)
+{
+	struct GNNTLMConfig nc;
+	struct GNCredSSPConfig cc;
+	struct GNNTLM *n;
+	struct GNCredSSP *c;
+	uint8_t h[32], pub[16];
+	LONG e;
+	unhex(cert_hash_hex, h);
+	memset(pub, 0x30, sizeof pub);
+	memset(&nc, 0, sizeof nc);
+	nc.Size = sizeof nc; nc.User = "u"; nc.Password = "p";
+	nc.Flags = GNF_CB_TLS_SERVER_END_POINT;
+	check("GN_NTLMNew: GNF_CB_TLS_SERVER_END_POINT without bindings is refused",
+	      GN_NTLMNew(&nc, &e) == NULL && e == GNERR_BADARGS);
+	nc.Flags = 0x80;
+	check("GN_NTLMNew: an unknown flag is refused", GN_NTLMNew(&nc, &e) == NULL && e == GNERR_BADARGS);
+	nc.Flags = 0; nc.ChannelBindings = h; nc.ChannelBindingsLength = 0;
+	check("GN_NTLMNew: bindings with length 0 are refused", GN_NTLMNew(&nc, &e) == NULL && e == GNERR_BADARGS);
+	nc.Flags = GNF_CB_TLS_SERVER_END_POINT; nc.ChannelBindingsLength = 32;
+	n = GN_NTLMNew(&nc, &e);
+	check("GN_NTLMNew with channel bindings", n && e == GNERR_OK && GN_NTLMGetAttr(n, GNA_CHANNELBINDINGS) == 1);
+	check("GN_NTLMGetAttr: a CredSSP attribute reads 0", n && GN_NTLMGetAttr(n, GNA_VERSION) == 0 &&
+	      GN_NTLMGetAttr(n, GNA_LASTERROR) == 0);
+	GN_NTLMFree(n);
+	/* a 1.0 caller: Size up to TargetName, the bindings fields unseen */
+	memset(&nc, 0, sizeof nc);
+	nc.Size = (ULONG)offsetof(struct GNNTLMConfig, ChannelBindings); nc.User = "u"; nc.Password = "p";
+	n = GN_NTLMNew(&nc, &e);
+	check("GN_NTLMNew with a 1.0 Size: unbound", n && GN_NTLMGetAttr(n, GNA_CHANNELBINDINGS) == 0);
+	GN_NTLMFree(n);
+	memset(&cc, 0, sizeof cc);
+	cc.Size = (ULONG)offsetof(struct GNCredSSPConfig, ChannelBindings);
+	cc.User = "u"; cc.Password = "p"; cc.PublicKey = pub; cc.PublicKeyLength = sizeof pub;
+	c = GN_CredSSPNew(&cc, &e);
+	check("GN_CredSSPNew with a 1.0 Size: unbound", c && GN_CredSSPGetAttr(c, GNA_CHANNELBINDINGS) == 0 &&
+	      GN_CredSSPGetAttr(c, GNA_STATE) == 0);
+	GN_CredSSPFree(c);
+	cc.Size = sizeof cc; cc.Flags = GNF_CB_TLS_SERVER_END_POINT;
+	check("GN_CredSSPNew: the flag without bindings is refused", GN_CredSSPNew(&cc, &e) == NULL && e == GNERR_BADARGS);
+	cc.ChannelBindings = h; cc.ChannelBindingsLength = 32;
+	c = GN_CredSSPNew(&cc, &e);
+	check("GN_CredSSPNew with channel bindings", c && GN_CredSSPGetAttr(c, GNA_CHANNELBINDINGS) == 1);
+	GN_CredSSPFree(c);
+}
+
 int main(void)
 {
 	test_md4();
@@ -523,6 +816,10 @@ int main(void)
 	test_winpr_transcript();
 	test_der();
 	test_api();
+	test_upper();
+	test_ntowfv2_unicode();
+	test_bindings();
+	test_api_bindings();
 	credssp_run(6, "Password", 0, GNERR_OK);
 	credssp_run(5, "Password", 0, GNERR_OK);
 	credssp_run(4, "Password", 0, GNERR_OK);
@@ -531,6 +828,7 @@ int main(void)
 	credssp_run(6, "not-the-password", 0, GNERR_SERVER);
 	credssp_run(6, "Password", 1, GNERR_PUBKEY);
 	credssp_run(3, "Password", 1, GNERR_PUBKEY);
+	test_credssp_bindings();
 	printf("%d passed, %d failed\n", pass, failed);
 	return failed ? 1 : 0;
 }

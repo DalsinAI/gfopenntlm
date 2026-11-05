@@ -30,6 +30,43 @@ void gn_ntowfv2(const uint8_t nt_hash[16], const uint8_t *user16, size_t ulen,
 	gn_hmac_md5_final(&h, out);
 }
 
+/* gss_channel_bindings_struct (RFC 2744 3.11) flattened as [MS-NLMP]
+ * 2.2.2.1 and RFC 4121 4.1.1.2 hash it, every count a 32-bit little-endian
+ * word: initiator_addrtype, initiator_address.length, acceptor_addrtype,
+ * acceptor_address.length (all 0, no addresses), application_data.length,
+ * application_data. For TLS the application_data is RFC 5929's
+ * "tls-server-end-point:" followed by the certificate hash. */
+static const char tls_end_point_prefix[] = "tls-server-end-point:";
+
+void gn_channel_bindings_hash(const uint8_t *data, size_t len, int tls_end_point, uint8_t out[16])
+{
+	struct gn_md5 c;
+	uint8_t hdr[20];
+	size_t plen = tls_end_point ? sizeof tls_end_point_prefix - 1 : 0;
+	memset(hdr, 0, sizeof hdr);
+	gn_put32(hdr + 16, (uint32_t)(plen + len));
+	gn_md5_init(&c);
+	gn_md5_update(&c, hdr, sizeof hdr);
+	if (plen) gn_md5_update(&c, tls_end_point_prefix, plen);
+	if (len) gn_md5_update(&c, data, len);
+	gn_md5_final(&c, out);
+}
+
+int gn_ntlm_set_bindings(struct gn_ntlm *n, const uint8_t *data, size_t len, int tls_end_point)
+{
+	if (n->state > 1) return GN_ESTATE;
+	if (!data || !len) {
+		/* unbound */
+		if (tls_end_point) return GN_EBADARGS;
+		memset(n->cb_hash, 0, 16);
+		n->cb_set = 0;
+		return GN_OK;
+	}
+	gn_channel_bindings_hash(data, len, tls_end_point, n->cb_hash);
+	n->cb_set = 1;
+	return GN_OK;
+}
+
 int gn_ntlm_init(struct gn_ntlm *n, const char *user, const char *domain,
                  const char *password, const char *workstation, const char *spn)
 {
@@ -190,8 +227,8 @@ int gn_ntlm_authenticate(struct gn_ntlm *n, const uint8_t *chal, size_t clen,
 		if (!raw) {
 			/* the server's pairs without its EOL (and without a flags pair,
 			 * which is put back with the MIC bit), then MsvAvFlags,
-			 * MsvAvTargetName, MsvChannelBindings (no TLS channel bindings:
-			 * Z(16)) and MsvAvEOL (3.1.5.1.2) */
+			 * MsvAvTargetName, MsvChannelBindings (the caller's channel
+			 * bindings hash, or Z(16) when unbound) and MsvAvEOL (3.1.5.1.2) */
 			avlen = i + 8 + 4 + (n->spn ? 4 + n->spn_len : 0) + 4 + 16 + 4;
 		}
 		temp_len = 28 + avlen + 4;
@@ -219,7 +256,8 @@ int gn_ntlm_authenticate(struct gn_ntlm *n, const uint8_t *chal, size_t clen,
 				gn_put16(q, MsvAvTargetName); gn_put16(q + 2, (uint16_t)n->spn_len);
 				memcpy(q + 4, n->spn, n->spn_len); q += 4 + n->spn_len;
 			}
-			gn_put16(q, MsvChannelBindings); gn_put16(q + 2, 16); q += 4 + 16;
+			gn_put16(q, MsvChannelBindings); gn_put16(q + 2, 16);
+			memcpy(q + 4, n->cb_hash, 16); q += 4 + 16;
 			gn_put16(q, MsvAvEOL); gn_put16(q + 2, 0); q += 4;
 			temp_len = (size_t)(q - temp) + 4;
 		}

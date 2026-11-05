@@ -9,7 +9,8 @@ By Team 6 / Sacredtrees for the AmiCradle Team. MIT licensed (LICENSE).
 ## What it does
 
 - NTLMv2 client: NEGOTIATE, CHALLENGE, AUTHENTICATE with the MIC,
-  MsvAvTargetName and the server's timestamp; extended session security,
+  MsvAvTargetName, optional TLS channel bindings (MsvChannelBindings,
+  tls-server-end-point, RFC 5929/RFC 2744) and the server's timestamp; extended session security,
   key exchange, GSS_WrapEx/GSS_UnwrapEx sealing and signing.
 - CredSSP client, TSRequest versions 2 to 6: NTLM in negoTokens, the TLS
   public key binding in pubKeyAuth (the SHA-256 binding hash with
@@ -34,6 +35,8 @@ or any other) was used.
 | FIPS 180-4 Secure Hash Standard | SHA-256 |
 | RFC 6229 Test Vectors for the Stream Cipher RC4 | RC4 (the cipher as described there) and its tests |
 | ITU-T X.690 (DER) | the ASN.1 encoding of TSRequest |
+| RFC 2744 3.11, RFC 4121 4.1.1.2, RFC 5929 | the channel bindings structure and tls-server-end-point |
+| The Unicode Standard's code charts (simple uppercase mappings) | NTOWFv2's Uppercase(User) |
 
 ## Building
 

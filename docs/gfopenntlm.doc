@@ -42,6 +42,36 @@ gfopenntlm.library/--background--               gfopenntlm.library/--background-
         length it used.
 
         Strings are UTF-8, converted to UTF-16LE as the protocols need.
+        NTOWFv2's Uppercase(User) ([MS-NLMP] 3.3.2) is the Unicode simple
+        uppercase mapping for Basic Latin, Latin-1 (not U+00B5), Latin
+        Extended-A (not U+0131 and U+017F, which Windows leaves alone),
+        Latin Extended-B to U+0233, the IPA letters with a Latin capital,
+        Greek U+0386..U+03CE, Cyrillic U+0430..U+04FF, Armenian, Latin
+        Extended Additional (U+1E00..U+1E95, U+1EA0..U+1EF9) and the
+        fullwidth Latin letters. Other letters (Greek Extended, Georgian,
+        Cherokee, outside the BMP, ...) are left as they are, and one-to-many
+        mappings (U+00DF) are not made. The domain is not upper-cased.
+
+    CHANNEL BINDINGS (1.1)
+        GNNTLMConfig and GNCredSSPConfig end with ChannelBindings and
+        ChannelBindingsLength. NULL/0, or a 1.0 Size without them, is
+        unbound: MsvChannelBindings is Z(16), as in 1.0. Otherwise the
+        AUTHENTICATE_MESSAGE carries MD5 of a gss_channel_bindings_struct
+        (RFC 2744 3.11, laid out as [MS-NLMP] 2.2.2.1 and RFC 4121 4.1.1.2
+        hash it: Z(16) for the empty addresses, the 32-bit little-endian
+        length of application_data, then application_data).
+
+        With Flags GNF_CB_TLS_SERVER_END_POINT, ChannelBindings is the
+        server certificate's tls-server-end-point hash (RFC 5929 4.1: the
+        certificate's signature hash, SHA-256 for MD5 and SHA-1) and the
+        library makes application_data "tls-server-end-point:" + hash;
+        without the flag ChannelBindings is the whole application_data.
+        GN_NTLMGetAttr()/GN_CredSSPGetAttr(GNA_CHANNELBINDINGS) is 1 when
+        bound. A Flags bit the library does not know, bindings of length 0
+        or the flag without bindings give GNERR_BADARGS.
+
+        CredSSP binds the TLS key in pubKeyAuth either way; the NTLM
+        bindings are for servers that check them (Extended Protection).
 
         A handle belongs to one task at a time. Separate handles can be used
         by separate tasks at once.
@@ -74,7 +104,8 @@ gfopenntlm.library/GN_Version                       gfopenntlm.library/GN_Versio
         ULONG GN_Version(VOID);
 
     RESULT
-        (version << 16) | revision, 0x00010000 for 1.0.
+        (version << 16) | revision: 0x00010000 for 1.0, 0x00010001 for 1.1
+        (channel bindings, GNA_CHANNELBINDINGS).
 
 gfopenntlm.library/GN_ErrorText                   gfopenntlm.library/GN_ErrorText
 
@@ -105,7 +136,8 @@ gfopenntlm.library/GN_NTLMNew                       gfopenntlm.library/GN_NTLMNe
     FUNCTION
         Makes a client context for one NTLM exchange ([MS-NLMP] 3.1.5.1)
         with User, Domain, Password, Workstation and TargetName (the
-        service principal name sent in MsvAvTargetName, or NULL).
+        service principal name sent in MsvAvTargetName, or NULL), and from
+        1.1 ChannelBindings (see CHANNEL BINDINGS).
 
         The client offers UNICODE, REQUEST_TARGET, SIGN, SEAL, NTLM,
         ALWAYS_SIGN, EXTENDED_SESSIONSECURITY, TARGET_INFO, VERSION, 128,
@@ -173,7 +205,8 @@ gfopenntlm.library/GN_NTLMAuthenticate     gfopenntlm.library/GN_NTLMAuthenticat
         Reads the server's CHALLENGE_MESSAGE (2.2.1.2) and writes the
         AUTHENTICATE_MESSAGE (2.2.1.3) with an NTLMv2 response (3.3.2).
         The server's AV pairs are sent back with MsvAvFlags (MIC present),
-        MsvAvTargetName and an all-zero MsvChannelBindings, and the MIC is
+        MsvAvTargetName and MsvChannelBindings (the configured channel
+        bindings hash, all-zero when unbound), and the MIC is
         computed (3.1.5.1.2). The time is the server's MsvAvTimestamp when
         it sends one (then the LM response is Z(24)), else the Amiga clock.
         With KEY_EXCH a random session key is sent encrypted with RC4.
@@ -243,7 +276,9 @@ gfopenntlm.library/GN_NTLMGetAttr               gfopenntlm.library/GN_NTLMGetAtt
     INPUTS
         attr - GNA_NTLMFLAGS (the negotiated flags), GNA_NTLMPEERVERSION
                (the CHALLENGE's Version field: major, minor and build as
-               little-endian bytes 0 to 3), GNA_STATE.
+               little-endian bytes 0 to 3), GNA_STATE (0 new, 1 NEGOTIATE
+               written, 2 authenticated), GNA_CHANNELBINDINGS (1.1: 1 when
+               bound). The CredSSP attributes read 0 here.
 
     RESULT
         The value, 0 for an unknown attribute.
@@ -270,7 +305,11 @@ gfopenntlm.library/GN_CredSSPNew                   gfopenntlm.library/GN_CredSSP
         SubjectPublicKeyInfo without its unused-bits byte (for RSA, the DER
         RSAPublicKey SEQUENCE). ServerName gives the SPN TERMSRV/ServerName.
         MaxVersion is the TSRequest version offered, 2 to 6 (0 means 6); the
-        exchange uses the lower of it and the server's.
+        exchange uses the lower of it and the server's. From 1.1,
+        ChannelBindings/ChannelBindingsLength (and Flags
+        GNF_CB_TLS_SERVER_END_POINT) give the NTLM exchange TLS channel
+        bindings (see CHANNEL BINDINGS); an RDP client passes the server
+        certificate's tls-server-end-point hash with the flag.
 
     RESULT
         The context, or NULL with *error set (GNERR_BADARGS without a
@@ -351,8 +390,13 @@ gfopenntlm.library/GN_CredSSPGetAttr           gfopenntlm.library/GN_CredSSPGetA
         attr - GNA_VERSION (the version in use), GNA_PEERVERSION (the
                server's), GNA_SERVERERROR (its errorCode), GNA_STATE (0 to 3
                as the exchange goes, 9 after an error), GNA_LASTERROR (the
-               GNERR_ code that ended it, as a ULONG), or an NTLM attribute
-               of GN_NTLMGetAttr().
+               GNERR_ code that ended it, as a ULONG), or one of the NTLM
+               exchange's: GNA_NTLMFLAGS, GNA_NTLMPEERVERSION,
+               GNA_CHANNELBINDINGS (1.1). GNA_STATE is CredSSP's own. The
+               NTLM exchange inside a CredSSP context has no GNNTLM handle.
+
+    RESULT
+        The value, 0 for an attribute a CredSSP context does not have.
 
 gfopenntlm.library/GN_CredSSPMessageLength
                                      gfopenntlm.library/GN_CredSSPMessageLength

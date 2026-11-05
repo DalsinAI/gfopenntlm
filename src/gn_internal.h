@@ -65,10 +65,12 @@ void gn_sys_cleanup(void);
 void gn_wipe(void *p, size_t n);
 
 /* ---- strings (gn_util.c) ---- */
-/* UTF-8 -> UTF-16LE; upper=1 maps letters to upper case (ASCII and
- * Latin-1). Returns a gn_alloc'd buffer (+2 zero bytes) and its byte
+/* UTF-8 -> UTF-16LE; upper=1 maps letters to upper case with gn_upper().
+ * Returns a gn_alloc'd buffer (+2 zero bytes) and its byte
  * length in *outlen, or NULL. */
 uint8_t *gn_utf16(const char *s, int upper, size_t *outlen);
+/* the simple uppercase of a code point, for the subset gn_util.c lists */
+uint32_t gn_upper(uint32_t c);
 void gn_put16(uint8_t *p, uint16_t v);
 void gn_put32(uint8_t *p, uint32_t v);
 uint16_t gn_get16(const uint8_t *p);
@@ -133,6 +135,8 @@ struct gn_ntlm {
 	struct gn_rc4 client_seal, server_seal;
 	uint32_t send_seq, recv_seq;
 	uint32_t peer_version;     /* the CHALLENGE's version field, low 32 bits */
+	uint8_t cb_hash[16];       /* MsvChannelBindings: Z(16) when unbound */
+	int cb_set;
 };
 
 /* error codes match libraries/gfopenntlm.h */
@@ -146,6 +150,11 @@ int gn_ntlm_wrap(struct gn_ntlm *n, const uint8_t *in, size_t len,
                  uint8_t *out, size_t size, size_t *outlen);
 int gn_ntlm_unwrap(struct gn_ntlm *n, const uint8_t *in, size_t len,
                    uint8_t *out, size_t size, size_t *outlen);
+/* channel bindings (2.2.2.1 MsvChannelBindings): MD5 of a
+ * gss_channel_bindings_struct whose application_data is data (prefixed with
+ * "tls-server-end-point:" when tls_end_point). Before gn_ntlm_authenticate. */
+void gn_channel_bindings_hash(const uint8_t *data, size_t len, int tls_end_point, uint8_t out[16]);
+int gn_ntlm_set_bindings(struct gn_ntlm *n, const uint8_t *data, size_t len, int tls_end_point);
 /* key derivation from an exported session key ([MS-NLMP] 3.4.5.2, 3.4.5.3);
  * server=1 swaps the directions (for tests that play the server) */
 void gn_ntlm_set_keys(struct gn_ntlm *n, const uint8_t exported[16], uint32_t flags, int server);
